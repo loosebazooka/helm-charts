@@ -1,0 +1,103 @@
+name: Test Scaffold Chart
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-scaffold:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4.1.1
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: changes
+        with:
+          filters: |
+            scaffold:
+              - 'charts/scaffold/**'
+              - '.github/workflows/scaffold-test.yml'
+
+      - name: Set up Helm
+        if: steps.changes.outputs.scaffold == 'true'
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: 'v3.19.2'
+
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        if: steps.changes.outputs.scaffold == 'true'
+        with:
+          python-version: '3.13'
+          check-latest: true
+
+      - name: Install Cosign
+        if: steps.changes.outputs.scaffold == 'true'
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
+      - name: Create KIND Cluster
+        if: steps.changes.outputs.scaffold == 'true'
+        uses: helm/kind-action@92086f6be054225fa813e0a4b13787fc9088faab # v1.13.0
+
+      - name: Install scaffold chart
+        if: steps.changes.outputs.scaffold == 'true'
+        run: |
+          # Create a custom values file for the scaffold test
+          cat > scaffold-test-values.yaml <<EOF
+          tuf:
+            enabled: true
+          tsa:
+            enabled: true
+            server:
+              args:
+                signer: memory
+          copySecretJob:
+            enabled: true
+          fulcio:
+            config:
+              contents:
+                OIDCIssuers:
+                  https://justtrustme.dev:
+                    IssuerURL: https://justtrustme.dev
+                    ClientID: sigstore
+                    Type: email
+                MetaIssuers: {}
+          EOF
+
+          helm install --wait --timeout 10m \
+            --repo https://sigstore.github.io/helm-charts \
+            -f scaffold-test-values.yaml \
+            test-scaffold \
+            scaffold
+
+      - name: Run Integration Tests
+        if: steps.changes.outputs.scaffold == 'true'
+        run: |
+          # Map local hostnames to the ingress controller
+          echo "127.0.0.1 fulcio.localhost rekor.localhost" | sudo tee -a /etc/hosts
+
+          # Create the blob to sign
+          echo "$(uuidgen)" > blob.txt
+
+          # Get an identity token from justtrustme.dev
+          echo "Fetching token from justtrustme.dev..."
+          curl -s "https://justtrustme.dev/token?email=test@example.com" | cut -d\" -f 4 > id_token.json
+          
+          # Sign the blob using the local Sigstore stack
+          echo "Signing blob.txt..."
+          cosign sign-blob blob.txt \
+            --identity-token=id_token.json \
+            --fulcio-url=http://fulcio.localhost \
+            --rekor-url=http://rekor.localhost \
+            --oidc-issuer=https://justtrustme.dev \
+            --bundle bundle.json \
+            --yes
+
+          echo "Verification..."
+          cosign verify-blob blob.txt \
+            --bundle bundle.json \
+            --certificate-identity test@example.com \
+            --certificate-oidc-issuer https://justtrustme.dev
